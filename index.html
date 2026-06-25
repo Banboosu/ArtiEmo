@@ -10,7 +10,9 @@
   <div class="stage">
     <header class="topbar">
       <span class="logo">ArtiEmo</span>
-      <span class="subtitle">LLM 情绪演出引擎 · 原型</span>
+      <span class="subtitle">LLM 情绪演出引擎</span>
+      <span class="mode-badge" id="modeBadge">演示模式</span>
+      <button id="settingsBtn" class="ghost icon-btn" title="设置">⚙</button>
     </header>
 
     <main class="scene">
@@ -28,8 +30,19 @@
       </section>
     </main>
 
+    <!-- 对话输入区（实时模式用） -->
+    <form class="chat-input" id="chatForm">
+      <input
+        type="text"
+        id="userInput"
+        placeholder="对她说点什么…（演示模式下点「播放演出」看样例）"
+        autocomplete="off"
+      />
+      <button type="submit" id="sendBtn">发送</button>
+    </form>
+
     <footer class="controls">
-      <button id="playBtn">▶ 播放演出</button>
+      <button id="playBtn" class="ghost">▶ 播放演示</button>
       <button id="skipBtn" class="ghost">跳过停顿</button>
       <label class="speed">
         速度
@@ -40,7 +53,61 @@
     </footer>
   </div>
 
+  <!-- 设置面板 -->
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h2>设置 · BYOK</h2>
+        <button class="ghost icon-btn" id="closeSettings">✕</button>
+      </div>
+
+      <p class="modal-note">
+        ArtiEmo 是纯静态前端，<b>无后端</b>。你的 Key 只存在<b>本机浏览器</b>里，
+        请求直接从浏览器打到你填的接口。建议用<b>临时/低额度</b> Key，或本地模型。
+      </p>
+
+      <div class="field">
+        <label>接口地址 (OpenAI 兼容 baseURL)</label>
+        <input type="text" id="cfgBaseURL" placeholder="https://api.openai.com/v1" />
+        <small>填到 /v1 即可，会自动拼 /chat/completions。可填任意兼容网关或本地模型(LM Studio / Ollama)。</small>
+      </div>
+
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" id="cfgApiKey" placeholder="sk-..." />
+      </div>
+
+      <div class="field">
+        <label>模型</label>
+        <input type="text" id="cfgModel" placeholder="gpt-4o-mini" />
+      </div>
+
+      <div class="field">
+        <label>Temperature <span id="tempVal">0.9</span></label>
+        <input type="range" id="cfgTemp" min="0" max="1.5" step="0.05" value="0.9" />
+      </div>
+
+      <details class="field char-fold">
+        <summary>角色卡（可选，留空用默认「綾」）</summary>
+        <label>角色名</label>
+        <input type="text" id="cfgCharName" placeholder="綾" />
+        <label>人物设定</label>
+        <textarea id="cfgCharPersona" rows="3" placeholder="内向敏感的少女…"></textarea>
+        <label>说话风格</label>
+        <textarea id="cfgCharStyle" rows="2" placeholder="短句、省略号、欲言又止…"></textarea>
+      </details>
+
+      <div class="modal-actions">
+        <button class="ghost" id="clearCfg">清除</button>
+        <button id="saveCfg">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="prompts/beat-protocol.system.js"></script>
+  <script src="data/character.js"></script>
   <script src="data/sample.js"></script>
+  <script src="src/llm.js"></script>
   <script src="src/engine.js"></script>
   <script src="src/app.js"></script>
 </body>

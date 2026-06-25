@@ -6,20 +6,40 @@
 **停顿、犹豫、欲言又止、表情变化、肢体动作**。ArtiEmo 把 LLM 的输出重新组织成
 一段可「演出」的 beat 序列，像 galgame 引擎一样逐拍播放。
 
-## 当前状态：Phase 1 — 演出引擎原型
+## 当前状态：Phase 2 — 接真实 LLM（BYOK，纯静态零后端）
 
-纯静态网页，零依赖，用模拟数据验证核心假设：**停顿到底能不能提升沉浸感。**
+纯静态网页，零依赖、零后端。两种模式：
 
-直接打开 `index.html` 即可运行（无需构建、无需服务器）：
+- **演示模式**（未配置 Key）：点「▶ 播放演示」播放内置样例脚本，验证演出节奏。
+- **实时模式**（配置 Key 后）：在输入框对话 → LLM 按 beat 协议输出 → 引擎逐拍演出。
+
+直接打开 `index.html` 即可运行（无需构建）。注意纯本地打开（file://）调真实接口可能受
+浏览器 CORS 限制，建议起个本地服务器：
 
 ```bash
-# 任选其一
-open index.html
-# 或起个本地服务器
 python3 -m http.server 8000   # 然后访问 http://localhost:8000
 ```
 
-点「▶ 播放演出」看效果。可调速度、可跳过停顿（调试用）。
+### 接 LLM（BYOK）
+
+点右上角 ⚙ 设置，填入：
+
+| 字段 | 说明 |
+|------|------|
+| 接口地址 | OpenAI 兼容 baseURL，填到 `/v1`（自动拼 `/chat/completions`）。可填任意兼容网关，或本地模型 LM Studio / Ollama |
+| API Key | 你自己的 key |
+| 模型 | 如 `gpt-4o-mini` |
+| 角色卡 | 可选，留空用默认「綾」 |
+
+> ⚠️ **Key 只存在本机浏览器 localStorage，无后端、不上传**。请求直接从浏览器打到你填的接口。
+> 建议用临时/低额度 Key，或本地模型。某些网关不允许浏览器跨域调用（CORS），换支持 CORS 的网关即可。
+
+### 容错设计
+
+- LLM 返回的 JSON 即使被 ```` ```json ```` 包裹、或前后带解释文字，也能抠出来解析。
+- 规则层 `normalizeBeats` 给所有 beat 兜底补全 `pre_delay` / `typing_speed`，
+  即使 LLM 漏给或给了离谱值，演出仍有节奏（这是「演出引擎」对「内容生成」的最后防线）。
+- `emotion_state` 每轮回灌给 LLM，实现连贯情绪漂移。
 
 ## 核心概念：Beat 协议
 
@@ -58,21 +78,27 @@ python3 -m http.server 8000   # 然后访问 http://localhost:8000
 
 ```
 ArtiEmo/
-├── index.html        # 舞台：左表情区 + 右文字框 + 控件
+├── index.html        # 舞台 + 输入框 + 设置面板
 ├── src/
-│   ├── engine.js     # ★ 演出引擎：beat 队列播放器（核心，与渲染解耦）
-│   ├── app.js        # 应用层：renderer 实现 + 控件交互
+│   ├── engine.js     # ★ 演出引擎：beat 队列播放器（核心，与渲染解耦，Phase 1 起不动）
+│   ├── llm.js        # ★ BYOK LLM 客户端：OpenAI 兼容请求 + 容错 JSON 解析 + 规则层补全
+│   ├── app.js        # 应用层：renderer 实现 + 演示/实时双模式 + 设置面板 + 对话循环
 │   └── styles.css    # galgame 风格样式
+├── prompts/
+│   ├── beat-protocol.system.md   # beat 协议 system prompt（人读版）
+│   └── beat-protocol.system.js   # 同内容 JS 版（前端 import，保持同步）
 └── data/
-    └── sample.js     # 示例 beat 脚本（情绪化对话样本）
+    ├── sample.js     # 演示模式的示例 beat 脚本
+    └── character.js  # 默认角色卡（可被设置面板覆盖）
 ```
 
 `engine.js` 是核心，且**与 DOM 解耦**——它只决定「何时该做什么」，
 具体怎么画交给注入的 `renderer`。未来换 UI 框架/换渲染目标都不动引擎。
+`llm.js` 也与引擎解耦——它只负责「拿到一段合法的 beat 序列」，怎么演由引擎管。
 
 ## 路线图
 
 - [x] **Phase 1** 演出引擎原型（模拟数据，验证沉浸感）
-- [ ] **Phase 2** Beat 协议 Prompt：约束 LLM 输出该 JSON + 规则层补全 `pre_delay`
-- [ ] **Phase 3** 情绪状态闭环：`emotion_state` 持久化 + 多轮漂移 + 角色卡系统
+- [x] **Phase 2** 接真实 LLM：beat 协议 prompt + BYOK OpenAI 兼容客户端 + 规则层补全 + emotion_state 多轮漂移
+- [ ] **Phase 3** 情绪状态深化：emotion_state 持久化 + 角色卡库 + 存档/读档
 - [ ] **Phase 4** 立绘差分图替换 emoji、语音合成
