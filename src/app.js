@@ -67,6 +67,9 @@ function startPlay() {
   stateReadout.textContent = "";
   emojiEl.textContent = "🙂";
   labelEl.textContent = "平静";
+  if (window.SAMPLE_SCRIPT.character) {
+    $("charName").textContent = window.SAMPLE_SCRIPT.character;
+  }
   playBtn.disabled = true;
   playBtn.textContent = "演出中…";
   engine.cancel();           // 取消上一场(若有)
