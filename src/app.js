@@ -26,13 +26,81 @@ const chatForm = $("chatForm");
 const userInput = $("userInput");
 const sendBtn = $("sendBtn");
 
+/* ── 调试 Console ──────────────────────────── */
+const debugConsole = $("debugConsole");
+const consoleBody = $("consoleBody");
+const consoleToggle = $("consoleToggle");
+const clearConsole = $("clearConsole");
+
+function logConsole(kind, payload, ms) {
+  if (!consoleBody) return;
+  const entry = document.createElement("div");
+  entry.className = "log-entry log-" + kind;
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const tag =
+    kind === "request" ? "→ 请求"
+    : kind === "raw" ? "← 原始输出"
+    : kind === "parsed" ? "✓ 解析结果"
+    : kind === "error" ? "✕ 错误"
+    : kind;
+  const msStr = ms != null ? `  (${Math.round(ms)}ms)` : "";
+  const head = document.createElement("div");
+  head.className = "log-head";
+  head.textContent = `[${time}] ${tag}${msStr}`;
+  const pre = document.createElement("pre");
+  pre.className = "log-payload";
+  pre.textContent =
+    typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  entry.appendChild(head);
+  entry.appendChild(pre);
+  consoleBody.appendChild(entry);
+  consoleBody.scrollTop = consoleBody.scrollHeight;
+}
+
 /* ── 会话状态 ─────────────────────────────── */
 let history = [];                 // [{role, content}] —— assistant 用纯台词回灌
 let emotionState = null;          // 随对话漂移
 let busy = false;
 let currentAbort = null;
 
-/* ── renderer：引擎调用这些回调来「演出」 ── */
+/* ── renderer：引擎调用这些回调来「演出」 ──
+ * 不再每轮清空 textflow —— 改为往「当前轮的角色块」里追加，
+ * textflow 变成可滚动的对话记录，保留历史，避免生硬。
+ */
+let currentCharBlock = null; // 本轮角色演出要写入的容器
+
+function ensureCharBlock() {
+  if (currentCharBlock) return currentCharBlock;
+  const block = document.createElement("div");
+  block.className = "turn char";
+  const name = document.createElement("div");
+  name.className = "turn-name";
+  name.textContent = activeCharacter().name || "綾";
+  const flow = document.createElement("div");
+  flow.className = "turn-flow";
+  block.appendChild(name);
+  block.appendChild(flow);
+  textflow.appendChild(block);
+  currentCharBlock = flow;
+  scrollToEnd();
+  return flow;
+}
+
+function appendUserTurn(text) {
+  const block = document.createElement("div");
+  block.className = "turn user";
+  const bubble = document.createElement("div");
+  bubble.className = "turn-bubble";
+  bubble.textContent = text;
+  block.appendChild(bubble);
+  textflow.appendChild(block);
+  scrollToEnd();
+}
+
+function scrollToEnd() {
+  textflow.scrollTop = textflow.scrollHeight;
+}
+
 const renderer = {
   setExpression(emoji, label) {
     emojiEl.textContent = emoji;
@@ -41,18 +109,19 @@ const renderer = {
     setTimeout(() => portrait.classList.remove("pop"), 180);
   },
   beginLine(type) {
+    const target = ensureCharBlock();
     const line = document.createElement("span");
     line.className = `line ${type}`;
     const caret = document.createElement("span");
     caret.className = "caret";
     line.appendChild(caret);
-    textflow.appendChild(line);
-    textflow.scrollTop = textflow.scrollHeight;
+    target.appendChild(line);
+    scrollToEnd();
     return { line, caret };
   },
   appendChar(handle, char) {
     handle.caret.insertAdjacentText("beforebegin", char);
-    textflow.scrollTop = textflow.scrollHeight;
+    scrollToEnd();
   },
   endLine(handle) {
     handle.caret.remove();
@@ -64,11 +133,13 @@ const renderer = {
   },
   onDone() {
     continueHint.classList.add("show");
+    currentCharBlock = null; // 本轮演出结束，下轮另起一块
     setBusy(false);
   },
 };
 
 const engine = new PerformanceEngine(renderer, { defaultTypingSpeed: 55 });
+window.engine = engine; // 方便控制台调试
 
 /* ── 模式与配置 ─────────────────────────────── */
 function activeCharacter() {
@@ -102,14 +173,15 @@ function setBusy(v) {
 }
 
 function resetStage(clearHistory = false) {
-  textflow.innerHTML = "";
   continueHint.classList.remove("show");
-  emojiEl.textContent = "🙂";
-  labelEl.textContent = "平静";
+  currentCharBlock = null;
   if (clearHistory) {
+    textflow.innerHTML = "";
     history = [];
     emotionState = null;
     stateReadout.textContent = "";
+    emojiEl.textContent = "🙂";
+    labelEl.textContent = "平静";
   }
 }
 
@@ -131,16 +203,23 @@ async function sendTurn(text) {
   if (busy || !text.trim()) return;
   const input = text.trim();
 
-  // 用户气泡先不画在 textflow（textflow 是角色的演出区），
-  // 这里直接清舞台、显示「思考中」表情，等 LLM 回来再演。
-  resetStage(false);
+  // 保留历史对话：先把用户这句追加到记录里，不清空舞台
+  continueHint.classList.remove("show");
+  appendUserTurn(input);
   setBusy(true);
   emojiEl.textContent = "💭";
   labelEl.textContent = "思考中";
   userInput.value = "";
 
   currentAbort = new AbortController();
+  const t0 = performance.now();
   try {
+    logConsole("request", {
+      userInput: input,
+      historyLen: history.length,
+      emotionState,
+    });
+
     const result = await ArtiEmoLLM.generateBeats({
       systemPrompt: window.BEAT_PROTOCOL_SYSTEM_PROMPT,
       character: activeCharacter(),
@@ -148,27 +227,31 @@ async function sendTurn(text) {
       emotionState,
       userInput: input,
       signal: currentAbort.signal,
+      onRaw: (raw) => logConsole("raw", raw),
     });
+
+    logConsole("parsed", { beats: result.beats, emotion_state: result.emotion_state }, performance.now() - t0);
 
     // 记历史：user 原文 + assistant 纯台词
     history.push({ role: "user", content: input });
     history.push({ role: "assistant", content: result.plainReply || "" });
-    // 限制历史长度，避免无限增长（保留最近 16 条）
     if (history.length > 16) history = history.slice(-16);
 
-    resetStage(false);
     await engine.play({ beats: result.beats, emotion_state: result.emotion_state });
   } catch (e) {
     if (e.name === "AbortError") {
       // 用户主动取消，不报错
     } else {
+      logConsole("error", e.message);
       emojiEl.textContent = "⚠️";
       labelEl.textContent = "出错";
-      const errLine = document.createElement("span");
-      errLine.className = "line action";
-      errLine.textContent = "演出失败：" + e.message;
-      textflow.appendChild(errLine);
+      const block = document.createElement("div");
+      block.className = "turn char error";
+      block.textContent = "演出失败：" + e.message;
+      textflow.appendChild(block);
+      scrollToEnd();
     }
+    currentCharBlock = null;
     setBusy(false);
   } finally {
     currentAbort = null;
@@ -265,6 +348,19 @@ $("clearCfg").addEventListener("click", () => {
   refreshMode();
   resetStage(true);
 });
+
+/* ── 调试 Console 控件 ─────────────────────── */
+if (consoleToggle) {
+  consoleToggle.addEventListener("click", () => {
+    const open = debugConsole.classList.toggle("open");
+    consoleToggle.textContent = open ? "▾ 调试台" : "▸ 调试台";
+  });
+}
+if (clearConsole) {
+  clearConsole.addEventListener("click", () => {
+    consoleBody.innerHTML = "";
+  });
+}
 
 /* ── 启动 ──────────────────────────────────── */
 refreshMode();

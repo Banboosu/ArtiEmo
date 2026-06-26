@@ -160,6 +160,7 @@ async function generateBeats({
   emotionState,
   userInput,
   signal,
+  onRaw,
 }) {
   const cfg = getConfig();
   if (!cfg.apiKey) throw new Error("未配置 API Key，请先在右上角设置。");
@@ -214,6 +215,7 @@ async function generateBeats({
 
   const data = await resp.json();
   const content = data.choices?.[0]?.message?.content;
+  if (typeof onRaw === "function") onRaw(content ?? "(空)");
   const parsed = extractJSON(content);
 
   if (!Array.isArray(parsed.beats)) {

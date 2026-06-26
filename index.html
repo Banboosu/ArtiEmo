@@ -51,6 +51,15 @@
       </label>
       <span class="state-readout" id="stateReadout"></span>
     </footer>
+
+    <!-- 调试台：显示 LLM 请求/原始输出/解析结果 -->
+    <section class="debug-console" id="debugConsole">
+      <div class="console-bar">
+        <button class="ghost console-toggle" id="consoleToggle">▸ 调试台</button>
+        <button class="ghost" id="clearConsole">清空</button>
+      </div>
+      <div class="console-body" id="consoleBody"></div>
+    </section>
   </div>
 
   <!-- 设置面板 -->
