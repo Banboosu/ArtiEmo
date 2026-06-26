@@ -60,6 +60,8 @@ function logConsole(kind, payload, ms) {
 /* ── 会话状态 ─────────────────────────────── */
 let history = [];                 // [{role, content}] —— assistant 用纯台词回灌
 let emotionState = null;          // 随对话漂移
+let transcript = [];              // 可重建的对话记录 [{role:'user',text}|{role:'char',beats,emotion_state}]
+let activeCardId = null;          // 当前角色卡 id
 let busy = false;
 let currentAbort = null;
 
@@ -86,7 +88,7 @@ function ensureCharBlock() {
   return flow;
 }
 
-function appendUserTurn(text) {
+function appendUserTurn(text, record = true) {
   const block = document.createElement("div");
   block.className = "turn user";
   const bubble = document.createElement("div");
@@ -94,6 +96,7 @@ function appendUserTurn(text) {
   bubble.textContent = text;
   block.appendChild(bubble);
   textflow.appendChild(block);
+  if (record) transcript.push({ role: "user", text });
   scrollToEnd();
 }
 
@@ -143,9 +146,79 @@ window.engine = engine; // 方便控制台调试
 
 /* ── 模式与配置 ─────────────────────────────── */
 function activeCharacter() {
-  const c = ArtiEmoLLM.getConfig();
-  if (c.character && c.character.name) return c.character;
-  return window.DEFAULT_CHARACTER;
+  return ArtiEmoStore.getCard(activeCardId) || ArtiEmoStore.listCards()[0];
+}
+
+/* ── 会话持久化 ──────────────────────────────
+ * 每轮结束后把 {cardId, history, emotionState, transcript} 存进 localStorage，
+ * 刷新页面 / 读档时按 transcript 瞬间重建对话(不走打字动画)。
+ */
+function snapshotSession() {
+  return {
+    cardId: activeCardId,
+    history,
+    emotionState,
+    transcript,
+  };
+}
+function autosave() {
+  ArtiEmoStore.saveSession(snapshotSession());
+}
+
+function restoreSession(session) {
+  if (!session) return false;
+  activeCardId = session.cardId || ArtiEmoStore.getActiveCardId();
+  history = session.history || [];
+  emotionState = session.emotionState || null;
+  transcript = session.transcript || [];
+  // 重建 DOM
+  textflow.innerHTML = "";
+  currentCharBlock = null;
+  for (const turn of transcript) {
+    if (turn.role === "user") {
+      appendUserTurn(turn.text, /*record=*/ false);
+    } else if (turn.role === "char") {
+      renderCharInstant(turn.beats || []);
+    }
+  }
+  if (emotionState) {
+    stateReadout.textContent =
+      `mood:${emotionState.mood}  affection:${emotionState.affection}  energy:${emotionState.energy}`;
+  }
+  // 末态表情：取最后一个 expression beat
+  const lastExpr = [...transcript].reverse()
+    .find((t) => t.role === "char" && (t.beats || []).some((b) => b.type === "expression"));
+  if (lastExpr) {
+    const e = [...lastExpr.beats].reverse().find((b) => b.type === "expression");
+    if (e) { emojiEl.textContent = e.emoji; labelEl.textContent = e.label; }
+  } else {
+    const c = activeCharacter();
+    emojiEl.textContent = c.emoji || "🙂";
+  }
+  scrollToEnd();
+  return true;
+}
+
+/* 瞬间渲染一整轮角色演出(读档用，无动画) */
+function renderCharInstant(beats) {
+  const block = document.createElement("div");
+  block.className = "turn char";
+  const name = document.createElement("div");
+  name.className = "turn-name";
+  name.textContent = activeCharacter().name || "綾";
+  const flow = document.createElement("div");
+  flow.className = "turn-flow";
+  block.appendChild(name);
+  block.appendChild(flow);
+  for (const b of beats) {
+    if (b.type === "dialogue" || b.type === "action") {
+      const line = document.createElement("span");
+      line.className = `line ${b.type}`;
+      line.textContent = b.content || "";
+      flow.appendChild(line);
+    }
+  }
+  textflow.appendChild(block);
 }
 
 function refreshMode() {
@@ -178,11 +251,23 @@ function resetStage(clearHistory = false) {
   if (clearHistory) {
     textflow.innerHTML = "";
     history = [];
+    transcript = [];
     emotionState = null;
     stateReadout.textContent = "";
-    emojiEl.textContent = "🙂";
+    const c = activeCharacter();
+    emojiEl.textContent = (c && c.emoji) || "🙂";
     labelEl.textContent = "平静";
   }
+}
+
+/* 开新会话：清空对话，情绪回到角色卡初始状态 */
+function newSession() {
+  engine.cancel();
+  resetStage(true);
+  const c = activeCharacter();
+  emotionState = c && c.initial_state ? { ...c.initial_state } : null;
+  charNameEl.textContent = (c && c.name) || "綾";
+  autosave();
 }
 
 /* ── 演示模式：播放样例脚本 ─────────────────── */
@@ -237,7 +322,11 @@ async function sendTurn(text) {
     history.push({ role: "assistant", content: result.plainReply || "" });
     if (history.length > 16) history = history.slice(-16);
 
+    // 记入可重建的对话记录
+    transcript.push({ role: "char", beats: result.beats, emotion_state: result.emotion_state });
+
     await engine.play({ beats: result.beats, emotion_state: result.emotion_state });
+    autosave(); // 演出结束后落盘（含最新 emotion_state）
   } catch (e) {
     if (e.name === "AbortError") {
       // 用户主动取消，不报错
@@ -283,16 +372,13 @@ chatForm.addEventListener("submit", (e) => {
   sendTurn(userInput.value);
 });
 
-/* ── 设置面板 ──────────────────────────────── */
+/* ── 设置面板（仅 LLM 连接，角色卡移到角色面板） ── */
 const settingsModal = $("settingsModal");
 const cfgBaseURL = $("cfgBaseURL");
 const cfgApiKey = $("cfgApiKey");
 const cfgModel = $("cfgModel");
 const cfgTemp = $("cfgTemp");
 const tempVal = $("tempVal");
-const cfgCharName = $("cfgCharName");
-const cfgCharPersona = $("cfgCharPersona");
-const cfgCharStyle = $("cfgCharStyle");
 
 function openSettings() {
   const c = ArtiEmoLLM.getConfig();
@@ -301,10 +387,6 @@ function openSettings() {
   cfgModel.value = c.model || "";
   cfgTemp.value = c.temperature ?? 0.9;
   tempVal.textContent = Number(cfgTemp.value).toFixed(2);
-  const ch = c.character || {};
-  cfgCharName.value = ch.name || "";
-  cfgCharPersona.value = ch.persona || "";
-  cfgCharStyle.value = ch.speaking_style || "";
   settingsModal.hidden = false;
 }
 function closeSettingsPanel() {
@@ -321,32 +403,20 @@ cfgTemp.addEventListener("input", () => {
 });
 
 $("saveCfg").addEventListener("click", () => {
-  const character =
-    cfgCharName.value.trim() || cfgCharPersona.value.trim() || cfgCharStyle.value.trim()
-      ? {
-          name: cfgCharName.value.trim() || "綾",
-          persona: cfgCharPersona.value.trim(),
-          speaking_style: cfgCharStyle.value.trim(),
-        }
-      : null;
-
   ArtiEmoLLM.saveConfig({
     baseURL: cfgBaseURL.value.trim() || ArtiEmoLLM.DEFAULT_CONFIG.baseURL,
     apiKey: cfgApiKey.value.trim(),
     model: cfgModel.value.trim() || ArtiEmoLLM.DEFAULT_CONFIG.model,
     temperature: parseFloat(cfgTemp.value),
-    character,
   });
   closeSettingsPanel();
   refreshMode();
-  resetStage(true);
 });
 
 $("clearCfg").addEventListener("click", () => {
   ArtiEmoLLM.clearConfig();
   closeSettingsPanel();
   refreshMode();
-  resetStage(true);
 });
 
 /* ── 调试 Console 控件 ─────────────────────── */
@@ -362,5 +432,174 @@ if (clearConsole) {
   });
 }
 
-/* ── 启动 ──────────────────────────────────── */
-refreshMode();
+/* ══════════ Phase 3: 角色面板 + 存档面板 ══════════ */
+const charModal = $("charModal");
+const cardList = $("cardList");
+const cardName = $("cardName");
+const cardEmoji = $("cardEmoji");
+const cardPersona = $("cardPersona");
+const cardStyle = $("cardStyle");
+let editingCardId = null;
+
+function renderCardList() {
+  cardList.innerHTML = "";
+  for (const c of ArtiEmoStore.listCards()) {
+    const row = document.createElement("div");
+    row.className = "card-row" + (c.id === activeCardId ? " active" : "");
+    row.innerHTML =
+      `<span class="card-emoji">${c.emoji || "🙂"}</span>` +
+      `<span class="card-meta"><b>${c.name}</b>` +
+      `<small>${(c.persona || "").slice(0, 28)}…</small></span>`;
+    const use = document.createElement("button");
+    use.className = "ghost mini";
+    use.textContent = c.id === activeCardId ? "使用中" : "切换";
+    use.disabled = c.id === activeCardId;
+    use.addEventListener("click", () => switchCard(c.id));
+    const edit = document.createElement("button");
+    edit.className = "ghost mini";
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => fillCardForm(c));
+    row.appendChild(use);
+    row.appendChild(edit);
+    if (!c.builtin) {
+      const del = document.createElement("button");
+      del.className = "ghost mini danger";
+      del.textContent = "删";
+      del.addEventListener("click", () => {
+        if (confirm(`删除角色卡「${c.name}」?`)) {
+          ArtiEmoStore.deleteCard(c.id);
+          if (activeCardId === c.id) switchCard(ArtiEmoStore.listCards()[0].id);
+          renderCardList();
+        }
+      });
+      row.appendChild(del);
+    }
+    cardList.appendChild(row);
+  }
+}
+
+function fillCardForm(c) {
+  editingCardId = c ? c.id : null;
+  cardName.value = c ? c.name : "";
+  cardEmoji.value = c ? c.emoji || "" : "";
+  cardPersona.value = c ? c.persona || "" : "";
+  cardStyle.value = c ? c.speaking_style || "" : "";
+}
+
+function switchCard(id) {
+  activeCardId = id;
+  ArtiEmoStore.setActiveCardId(id);
+  newSession();          // 换角色 = 开新会话（情绪回到该卡初始状态）
+  refreshMode();
+  renderCardList();
+}
+
+$("charBtn").addEventListener("click", () => {
+  renderCardList();
+  fillCardForm(activeCharacter());
+  charModal.hidden = false;
+});
+$("closeChar").addEventListener("click", () => (charModal.hidden = true));
+charModal.addEventListener("click", (e) => {
+  if (e.target === charModal) charModal.hidden = true;
+});
+$("newCard").addEventListener("click", () => fillCardForm(null));
+$("saveCard").addEventListener("click", () => {
+  if (!cardName.value.trim()) {
+    alert("角色名不能为空");
+    return;
+  }
+  const saved = ArtiEmoStore.upsertCard({
+    id: editingCardId || undefined,
+    name: cardName.value.trim(),
+    emoji: cardEmoji.value.trim() || "🙂",
+    persona: cardPersona.value.trim(),
+    speaking_style: cardStyle.value.trim(),
+    initial_state:
+      (ArtiEmoStore.getCard(editingCardId) || {}).initial_state ||
+      { mood: "calm", affection: 30, energy: 0.5 },
+  });
+  editingCardId = saved.id;
+  renderCardList();
+});
+
+/* ── 存档面板 ── */
+const saveModal = $("saveModal");
+const saveList = $("saveList");
+const saveName = $("saveName");
+
+function renderSaveList() {
+  saveList.innerHTML = "";
+  const saves = ArtiEmoStore.listSaves();
+  if (!saves.length) {
+    saveList.innerHTML = '<div class="empty">还没有存档。</div>';
+    return;
+  }
+  for (const s of saves) {
+    const row = document.createElement("div");
+    row.className = "save-row";
+    const turns = (s.session.transcript || []).filter((t) => t.role === "user").length;
+    row.innerHTML =
+      `<span class="save-meta"><b>${s.name}</b>` +
+      `<small>${new Date(s.ts).toLocaleString("zh-CN")} · ${turns} 轮</small></span>`;
+    const load = document.createElement("button");
+    load.className = "ghost mini";
+    load.textContent = "读取";
+    load.addEventListener("click", () => {
+      engine.cancel();
+      restoreSession(s.session);
+      ArtiEmoStore.setActiveCardId(activeCardId);
+      autosave();
+      refreshMode();
+      saveModal.hidden = true;
+    });
+    const del = document.createElement("button");
+    del.className = "ghost mini danger";
+    del.textContent = "删";
+    del.addEventListener("click", () => {
+      ArtiEmoStore.deleteSave(s.id);
+      renderSaveList();
+    });
+    row.appendChild(load);
+    row.appendChild(del);
+    saveList.appendChild(row);
+  }
+}
+
+$("saveBtn").addEventListener("click", () => {
+  saveName.value = "";
+  renderSaveList();
+  saveModal.hidden = false;
+});
+$("closeSave").addEventListener("click", () => (saveModal.hidden = true));
+saveModal.addEventListener("click", (e) => {
+  if (e.target === saveModal) saveModal.hidden = true;
+});
+$("doSave").addEventListener("click", () => {
+  if (!transcript.length) {
+    alert("当前还没有对话内容可存。");
+    return;
+  }
+  ArtiEmoStore.createSave(saveName.value.trim(), snapshotSession());
+  renderSaveList();
+  saveName.value = "";
+});
+$("newSessionBtn").addEventListener("click", () => {
+  if (transcript.length && !confirm("开始新会话？当前未存档的对话会被清空（已自动保存到当前会话槽）。")) return;
+  newSession();
+});
+
+/* ── 启动：恢复上次会话 / 初始化角色 ── */
+(function init() {
+  activeCardId = ArtiEmoStore.getActiveCardId();
+  const session = ArtiEmoStore.loadSession();
+  if (session && (session.transcript || []).length) {
+    restoreSession(session);
+  } else {
+    const c = activeCharacter();
+    emotionState = c && c.initial_state ? { ...c.initial_state } : null;
+    emojiEl.textContent = (c && c.emoji) || "🙂";
+    charNameEl.textContent = (c && c.name) || "綾";
+  }
+  refreshMode();
+})();
