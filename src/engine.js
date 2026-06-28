@@ -52,7 +52,7 @@ class PerformanceEngine {
   }
 
   /**
-   * 播放一个完整脚本
+   * 播放一个完整脚本（非流式，一次性传入全部 beats）
    * @param {object} script  { beats: [...], emotion_state?: {...} }
    */
   async play(script) {
@@ -63,24 +63,81 @@ class PerformanceEngine {
     const beats = script.beats || [];
     for (const beat of beats) {
       if (this._cancelled) break;
-
-      // 1. 关键：beat 播放前的停顿 —— 这是「思考/犹豫/欲言又止」的来源
-      await this._sleep(beat.pre_delay ?? 0);
-      if (this._cancelled) break;
-
-      if (beat.type === "expression") {
-        this.renderer.setExpression(beat.emoji, beat.label);
-      } else if (beat.type === "dialogue" || beat.type === "action") {
-        const handle = this.renderer.beginLine(beat.type);
-        const speed = beat.typing_speed ?? this.defaultTypingSpeed;
-        await this._typeOut(handle, beat.content ?? "", speed);
-        this.renderer.endLine(handle);
-      }
+      await this._playBeat(beat);
     }
 
     if (script.emotion_state) this.renderer.onState(script.emotion_state);
     if (!this._cancelled) this.renderer.onDone();
     this._running = false;
+  }
+
+  /** 播放单个 beat（pre_delay → 表情/打字），play 与 playStream 共用 */
+  async _playBeat(beat) {
+    // 1. 关键：beat 播放前的停顿 —— 这是「思考/犹豫/欲言又止」的来源
+    await this._sleep(beat.pre_delay ?? 0);
+    if (this._cancelled) return;
+
+    if (beat.type === "expression") {
+      this.renderer.setExpression(beat.emoji, beat.label);
+    } else if (beat.type === "dialogue" || beat.type === "action") {
+      const handle = this.renderer.beginLine(beat.type);
+      const speed = beat.typing_speed ?? this.defaultTypingSpeed;
+      await this._typeOut(handle, beat.content ?? "", speed);
+      this.renderer.endLine(handle);
+    }
+  }
+
+  /**
+   * 流式播放：beat 边到边演，不必等整段生成完。
+   * 返回一个「控制器」，生产者(llm.js)通过它推送 beat / 结束 / 报错。
+   *
+   *   const ctrl = engine.playStream();
+   *   ctrl.push(beat);            // 收到一个完整 beat 就推进来
+   *   ctrl.setState(emotionState);// 收到 emotion_state（可选，通常在最后）
+   *   ctrl.done();                // 流正常结束
+   *   ctrl.fail(err);             // 流出错（已演出的部分保留）
+   *
+   * 引擎内部维护一个队列：有 beat 就播，没 beat 但流没结束就等待。
+   * 这样「第一个 beat 一到就开始演」，首字延迟 = 第一个 beat 的生成时间。
+   */
+  playStream() {
+    if (this._running) return null;
+    this._running = true;
+    this._cancelled = false;
+
+    const queue = [];
+    let finished = false;
+    let pendingState = null;
+    let notify = null; // 唤醒等待中的消费者
+
+    const wake = () => {
+      if (notify) { notify(); notify = null; }
+    };
+
+    // 消费者循环：串行播放队列里的 beat
+    const consumer = (async () => {
+      while (!this._cancelled) {
+        if (queue.length === 0) {
+          if (finished) break;
+          // 队列空且流未结束 —— 等待新 beat 或结束信号
+          await new Promise((res) => { notify = res; });
+          continue;
+        }
+        const beat = queue.shift();
+        await this._playBeat(beat);
+      }
+      if (pendingState) this.renderer.onState(pendingState);
+      if (!this._cancelled) this.renderer.onDone();
+      this._running = false;
+    })();
+
+    return {
+      push: (beat) => { if (beat) { queue.push(beat); wake(); } },
+      setState: (s) => { pendingState = s; },
+      done: () => { finished = true; wake(); },
+      fail: () => { finished = true; wake(); }, // 出错也让消费者收尾，保留已演部分
+      whenDone: () => consumer,
+    };
   }
 }
 

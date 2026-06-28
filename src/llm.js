@@ -233,13 +233,186 @@ async function generateBeats({
   };
 }
 
+/* ── 增量 beat 流式解析器 (方案A) ──────────────────────────
+ * 喂入累积的文本，每当一个完整 beat 对象闭合就吐出来。
+ * 不依赖整段 JSON 合法——只在 "beats" 数组范围内逐个抠对象。
+ */
+function createBeatStreamParser() {
+  let buf = "";
+  let scanFrom = 0;       // 下次扫描起点
+  let inBeatsArray = false;
+
+  function tryLocateBeatsArray() {
+    if (inBeatsArray) return;
+    const key = buf.indexOf('"beats"');
+    if (key === -1) return;
+    const bracket = buf.indexOf("[", key);
+    if (bracket === -1) return;
+    inBeatsArray = true;
+    scanFrom = bracket + 1;
+  }
+
+  // 从 scanFrom 起，找下一个完整 { ... }（括号配平，忽略字符串内括号）
+  function nextObject() {
+    let i = scanFrom;
+    while (i < buf.length && /[\s,]/.test(buf[i])) i++;
+    if (i >= buf.length) { scanFrom = i; return null; }
+    if (buf[i] === "]") { scanFrom = i; return null; }  // 数组结束
+    if (buf[i] !== "{") { scanFrom = i; return null; }  // 还没到对象起点
+
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < buf.length; j++) {
+      const ch = buf[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const objStr = buf.slice(i, j + 1);
+          scanFrom = j + 1;
+          try { return JSON.parse(objStr); }
+          catch { return null; }
+        }
+      }
+    }
+    scanFrom = i; // 没闭合，等更多数据
+    return null;
+  }
+
+  return {
+    /** 喂入累积后的完整文本，返回本次新闭合的 beat 数组 */
+    feed(fullText) {
+      buf = fullText;
+      tryLocateBeatsArray();
+      if (!inBeatsArray) return [];
+      const out = [];
+      let guard = 0;
+      while (guard++ < 1000) {
+        const before = scanFrom;
+        const obj = nextObject();
+        if (obj) { if (obj.type) out.push(obj); continue; }
+        if (scanFrom === before) break; // 没进展，等更多数据
+        break;                          // 遇到 ] 或非法对象
+      }
+      return out;
+    },
+    /** 流结束后用主解析器抠 emotion_state（鲁棒） */
+    getEmotionState() {
+      try { return extractJSON(buf).emotion_state || null; }
+      catch { return null; }
+    },
+  };
+}
+
+/* ── 流式生成 beats (方案A) ────────────────────────────────
+ * stream:true + SSE 读取 + 增量 beat 提取，beat 边到边回调。
+ * 网关不支持 stream 时自动回退非流式。
+ */
+async function generateBeatsStream({
+  systemPrompt, character, history, emotionState, userInput,
+  signal, onBeat, onState, onRaw,
+}) {
+  const cfg = getConfig();
+  if (!cfg.apiKey) throw new Error("未配置 API Key，请先在右上角设置。");
+
+  const messages = buildMessages({ systemPrompt, character, history, emotionState, userInput });
+  const url = cfg.baseURL.replace(/\/+$/, "") + "/chat/completions";
+  const body = {
+    model: cfg.model,
+    messages,
+    temperature: cfg.temperature ?? 0.9,
+    response_format: { type: "json_object" },
+    stream: true,
+  };
+
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    throw new Error(`请求失败：${e.message}。若是 CORS 报错，说明该网关不允许浏览器直接调用。`);
+  }
+
+  if (!resp.ok) {
+    let detail = "";
+    try { const j = await resp.json(); detail = j.error?.message || JSON.stringify(j); }
+    catch { detail = await resp.text().catch(() => ""); }
+    throw new Error(`API ${resp.status}：${detail || resp.statusText}`);
+  }
+
+  // 网关不支持流式 → 回退非流式
+  const ctype = resp.headers.get("content-type") || "";
+  if (!resp.body || (!ctype.includes("event-stream") && ctype.includes("application/json"))) {
+    const data = await resp.json();
+    const content = data.choices?.[0]?.message?.content ?? "";
+    if (onRaw) onRaw(content);
+    const parsed = extractJSON(content);
+    const beats = normalizeBeats(parsed.beats || []);
+    for (const b of beats) onBeat && onBeat(b);
+    if (onState) onState(parsed.emotion_state || emotionState || null);
+    return { plainReply: beats.filter((b) => b.type === "dialogue").map((b) => b.content).join("") };
+  }
+
+  // 真·流式：读 SSE
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const parser = createBeatStreamParser();
+  let sseBuf = "";
+  let contentAccum = "";
+  const dialogueParts = [];
+
+  const flush = () => {
+    for (const raw of parser.feed(contentAccum)) {
+      const [b] = normalizeBeats([raw]);
+      if (!b) continue;
+      if (b.type === "dialogue") dialogueParts.push(b.content);
+      onBeat && onBeat(b);
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    sseBuf += decoder.decode(value, { stream: true });
+    const lines = sseBuf.split("\n");
+    sseBuf = lines.pop() || "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const delta = JSON.parse(payload).choices?.[0]?.delta?.content;
+        if (delta) { contentAccum += delta; flush(); }
+      } catch { /* 不完整 data 行，忽略 */ }
+    }
+  }
+
+  if (onRaw) onRaw(contentAccum);
+  if (onState) onState(parser.getEmotionState() || emotionState || null);
+  return { plainReply: dialogueParts.join("") };
+}
+
 window.ArtiEmoLLM = {
   getConfig,
   saveConfig,
   clearConfig,
   isConfigured,
   generateBeats,
+  generateBeatsStream,
   normalizeBeats,
   extractJSON,
+  createBeatStreamParser,
   DEFAULT_CONFIG,
 };

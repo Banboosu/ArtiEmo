@@ -298,35 +298,46 @@ async function sendTurn(text) {
 
   currentAbort = new AbortController();
   const t0 = performance.now();
+  let firstBeatMs = null;
   try {
-    logConsole("request", {
-      userInput: input,
-      historyLen: history.length,
-      emotionState,
-    });
+    logConsole("request", { userInput: input, historyLen: history.length, emotionState });
 
-    const result = await ArtiEmoLLM.generateBeats({
+    // 流式：beat 边到边演，首字延迟 = 第一个 beat 生成时间
+    const ctrl = engine.playStream();
+    const collectedBeats = [];
+    let finalState = emotionState;
+
+    const result = await ArtiEmoLLM.generateBeatsStream({
       systemPrompt: window.BEAT_PROTOCOL_SYSTEM_PROMPT,
       character: activeCharacter(),
       history,
       emotionState,
       userInput: input,
       signal: currentAbort.signal,
+      onBeat: (beat) => {
+        if (firstBeatMs == null) {
+          firstBeatMs = performance.now() - t0;
+          logConsole("parsed", { firstBeat: beat, 首字延迟ms: Math.round(firstBeatMs) });
+        }
+        collectedBeats.push(beat);
+        ctrl.push(beat);
+      },
+      onState: (s) => { finalState = s; ctrl.setState(s); },
       onRaw: (raw) => logConsole("raw", raw),
     });
 
-    logConsole("parsed", { beats: result.beats, emotion_state: result.emotion_state }, performance.now() - t0);
+    ctrl.done();
+    await ctrl.whenDone(); // 等演出真正播完（含打字/停顿）
 
-    // 记历史：user 原文 + assistant 纯台词
+    logConsole("parsed", { beats: collectedBeats, emotion_state: finalState, 总耗时ms: Math.round(performance.now() - t0) });
+
+    // 记历史 + 可重建记录
     history.push({ role: "user", content: input });
     history.push({ role: "assistant", content: result.plainReply || "" });
     if (history.length > 16) history = history.slice(-16);
+    transcript.push({ role: "char", beats: collectedBeats, emotion_state: finalState });
 
-    // 记入可重建的对话记录
-    transcript.push({ role: "char", beats: result.beats, emotion_state: result.emotion_state });
-
-    await engine.play({ beats: result.beats, emotion_state: result.emotion_state });
-    autosave(); // 演出结束后落盘（含最新 emotion_state）
+    autosave();
   } catch (e) {
     if (e.name === "AbortError") {
       // 用户主动取消，不报错
